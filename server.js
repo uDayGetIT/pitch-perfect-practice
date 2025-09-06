@@ -1,4 +1,4 @@
-// server.js - Final Production Version
+// server.js - Complete Render Production Version
 const express = require('express');
 const cors = require('cors');
 const ytdl = require('ytdl-core');
@@ -10,27 +10,76 @@ const { v4: uuidv4 } = require('uuid');
 const app = express();
 const PORT = process.env.PORT || 3001;
 
-// Middleware
+// FFmpeg path configuration for Render
+if (process.env.NODE_ENV === 'production') {
+    const ffmpegPaths = ['/usr/bin/ffmpeg', '/usr/local/bin/ffmpeg', '/opt/render/project/src/node_modules/ffmpeg-static/ffmpeg'];
+    for (const ffmpegPath of ffmpegPaths) {
+        if (fs.existsSync(ffmpegPath)) {
+            ffmpeg.setFfmpegPath(ffmpegPath);
+            console.log(`FFmpeg found at: ${ffmpegPath}`);
+            break;
+        }
+    }
+}
+
+// CORS configuration with your Render URL
 app.use(cors({
-    origin: process.env.NODE_ENV === 'production' 
-        ? ['https://your-app-name.onrender.com'] 
-        : ['http://localhost:3000', 'http://localhost:8000', 'http://127.0.0.1:8000']
+    origin: function (origin, callback) {
+        if (!origin) return callback(null, true);
+        
+        const allowedOrigins = process.env.NODE_ENV === 'production' 
+            ? [
+                'https://pitch-perfect-practice.onrender.com',
+                /^https:\/\/.*\.onrender\.com$/
+              ] 
+            : [
+                'http://localhost:3000', 
+                'http://localhost:8000', 
+                'http://127.0.0.1:8000',
+                'http://localhost:3001'
+              ];
+        
+        const isAllowed = allowedOrigins.some(allowed => {
+            if (typeof allowed === 'string') {
+                return origin === allowed;
+            }
+            return allowed.test(origin);
+        });
+        
+        callback(null, true); // Allow all origins for now
+    },
+    credentials: true,
+    methods: ['GET', 'POST', 'OPTIONS'],
+    allowedHeaders: ['Content-Type', 'Authorization']
 }));
+
 app.use(express.json({ limit: '50mb' }));
 app.use(express.static('public'));
 
-// Create temp directory for processing
+// Create temp directory
 const tempDir = path.join(__dirname, 'temp');
 if (!fs.existsSync(tempDir)) {
     fs.mkdirSync(tempDir, { recursive: true });
 }
 
-// Serve frontend on root
+// Serve frontend
 app.get('/', (req, res) => {
     res.sendFile(path.join(__dirname, 'public', 'index.html'));
 });
 
-// Clean up temp files older than 30 minutes
+// Health check
+app.get('/api/health', (req, res) => {
+    res.json({ 
+        status: 'OK', 
+        message: 'Pitch Perfect Practice Backend is running',
+        timestamp: new Date().toISOString(),
+        uptime: process.uptime(),
+        memory: process.memoryUsage(),
+        environment: process.env.NODE_ENV || 'development'
+    });
+});
+
+// Cleanup function
 const cleanupTempFiles = () => {
     try {
         if (!fs.existsSync(tempDir)) return;
@@ -44,8 +93,7 @@ const cleanupTempFiles = () => {
                 const stats = fs.statSync(filePath);
                 const fileAge = now - stats.mtime.getTime();
                 
-                // Delete files older than 30 minutes (1800000 ms)
-                if (fileAge > 1800000) {
+                if (fileAge > 900000) { // 15 minutes
                     fs.unlinkSync(filePath);
                     console.log(`Cleaned up old temp file: ${file}`);
                 }
@@ -58,81 +106,99 @@ const cleanupTempFiles = () => {
     }
 };
 
-// Run cleanup every 10 minutes
-setInterval(cleanupTempFiles, 600000);
+setInterval(cleanupTempFiles, 300000); // 5 minutes
 
-// Endpoint to get video information
+// Video info endpoint
 app.get('/api/video-info/:videoId', async (req, res) => {
     try {
         const { videoId } = req.params;
         
         if (!videoId || !/^[a-zA-Z0-9_-]{11}$/.test(videoId)) {
-            return res.status(400).json({ error: 'Invalid video ID' });
+            return res.status(400).json({ error: 'Invalid video ID format' });
         }
         
         const videoUrl = `https://www.youtube.com/watch?v=${videoId}`;
         
-        // Add timeout for ytdl.getInfo
         const timeoutPromise = new Promise((_, reject) => {
-            setTimeout(() => reject(new Error('Request timeout')), 10000);
+            setTimeout(() => reject(new Error('Request timeout')), 15000);
         });
         
-        const infoPromise = ytdl.getInfo(videoUrl);
-        const info = await Promise.race([infoPromise, timeoutPromise]);
+        const infoPromise = ytdl.getInfo(videoUrl, {
+            requestOptions: {
+                headers: {
+                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+                }
+            }
+        });
         
+        const info = await Promise.race([infoPromise, timeoutPromise]);
         const videoDetails = info.videoDetails;
+        
+        const duration = parseInt(videoDetails.lengthSeconds || 0);
+        if (duration > 600) {
+            return res.status(400).json({ 
+                error: 'Video too long. Please use videos under 10 minutes.' 
+            });
+        }
         
         res.json({
             title: videoDetails.title || 'Unknown Title',
-            duration: formatDuration(videoDetails.lengthSeconds || 0),
+            duration: formatDuration(duration),
             view_count: formatNumber(videoDetails.viewCount || 0),
             author: videoDetails.author?.name || 'Unknown Author',
             description: (videoDetails.shortDescription || '').substring(0, 200) + '...',
+            lengthSeconds: duration
         });
+        
     } catch (error) {
         console.error('Error fetching video info:', error);
-        res.status(500).json({ 
-            error: 'Failed to fetch video information',
-            message: error.message
-        });
+        
+        if (error.message.includes('Video unavailable')) {
+            res.status(404).json({ error: 'Video not found or is private/restricted' });
+        } else if (error.message.includes('timeout')) {
+            res.status(408).json({ error: 'Request timeout - please try again' });
+        } else {
+            res.status(500).json({ 
+                error: 'Failed to fetch video information'
+            });
+        }
     }
 });
 
-// Main endpoint to process audio
+// Audio processing endpoint
 app.post('/api/process-audio', async (req, res) => {
     const { videoId, pitchShift = 0, playbackSpeed = 1 } = req.body;
     
-    // Validation
-    if (!videoId) {
-        return res.status(400).json({ error: 'Video ID is required' });
-    }
-    
-    if (!/^[a-zA-Z0-9_-]{11}$/.test(videoId)) {
-        return res.status(400).json({ error: 'Invalid video ID format' });
+    if (!videoId || !/^[a-zA-Z0-9_-]{11}$/.test(videoId)) {
+        return res.status(400).json({ error: 'Invalid video ID' });
     }
     
     if (pitchShift < -12 || pitchShift > 12) {
-        return res.status(400).json({ error: 'Pitch shift must be between -12 and 12 semitones' });
+        return res.status(400).json({ error: 'Pitch shift must be between -12 and 12' });
     }
     
     if (playbackSpeed < 0.25 || playbackSpeed > 2.0) {
-        return res.status(400).json({ error: 'Playback speed must be between 0.25 and 2.0' });
+        return res.status(400).json({ error: 'Speed must be between 0.25 and 2.0' });
     }
 
     const sessionId = uuidv4();
     const inputFile = path.join(tempDir, `${sessionId}_input.webm`);
     const outputFile = path.join(tempDir, `${sessionId}_output.mp3`);
     
-    console.log(`Processing audio for video: ${videoId}, pitch: ${pitchShift}, speed: ${playbackSpeed}`);
+    console.log(`Processing: ${videoId}, pitch: ${pitchShift}, speed: ${playbackSpeed}`);
+
+    const requestTimeout = setTimeout(() => {
+        if (!res.headersSent) {
+            res.status(408).json({ error: 'Processing timeout' });
+        }
+    }, 25000);
 
     try {
-        // Step 1: Download audio from YouTube
         await downloadYouTubeAudio(videoId, inputFile);
-        
-        // Step 2: Process audio with FFmpeg
         await processAudioWithFFmpeg(inputFile, outputFile, pitchShift, playbackSpeed);
         
-        // Step 3: Stream the processed audio back to client
+        clearTimeout(requestTimeout);
+        
         res.setHeader('Content-Type', 'audio/mpeg');
         res.setHeader('Content-Disposition', 'attachment; filename="processed_audio.mp3"');
         res.setHeader('Cache-Control', 'no-cache');
@@ -140,7 +206,6 @@ app.post('/api/process-audio', async (req, res) => {
         const audioStream = fs.createReadStream(outputFile);
         audioStream.pipe(res);
         
-        // Clean up files after streaming
         audioStream.on('end', () => {
             setTimeout(() => {
                 [inputFile, outputFile].forEach(file => {
@@ -150,37 +215,32 @@ app.post('/api/process-audio', async (req, res) => {
                         });
                     }
                 });
-            }, 5000); // Wait 5 seconds before cleanup
-        });
-        
-        audioStream.on('error', (error) => {
-            console.error('Stream error:', error);
-            res.status(500).json({ error: 'Failed to stream audio' });
+            }, 5000);
         });
         
     } catch (error) {
+        clearTimeout(requestTimeout);
         console.error('Error processing audio:', error);
         
-        // Clean up files on error
         [inputFile, outputFile].forEach(file => {
             if (fs.existsSync(file)) {
-                fs.unlink(file, (err) => {
-                    if (err) console.error('Error deleting file:', err);
-                });
+                fs.unlink(file, () => {});
             }
         });
         
-        if (error.message.includes('Video unavailable')) {
-            res.status(404).json({ error: 'Video not available or restricted' });
-        } else if (error.message.includes('timeout')) {
-            res.status(408).json({ error: 'Request timeout - video may be too long' });
-        } else {
-            res.status(500).json({ error: 'Failed to process audio: ' + error.message });
+        if (!res.headersSent) {
+            if (error.message.includes('Video unavailable')) {
+                res.status(404).json({ error: 'Video not available' });
+            } else if (error.message.includes('timeout')) {
+                res.status(408).json({ error: 'Processing timeout' });
+            } else {
+                res.status(500).json({ error: 'Failed to process audio' });
+            }
         }
     }
 });
 
-// Function to download audio from YouTube
+// Download audio function
 function downloadYouTubeAudio(videoId, outputPath) {
     return new Promise((resolve, reject) => {
         const videoUrl = `https://www.youtube.com/watch?v=${videoId}`;
@@ -198,40 +258,36 @@ function downloadYouTubeAudio(videoId, outputPath) {
 
             const writeStream = fs.createWriteStream(outputPath);
             
-            // Add timeout
             const timeout = setTimeout(() => {
                 audioStream.destroy();
                 writeStream.destroy();
                 reject(new Error('Download timeout'));
-            }, 60000); // 60 second timeout
+            }, 30000);
             
             audioStream.pipe(writeStream);
             
             audioStream.on('error', (error) => {
                 clearTimeout(timeout);
-                console.error('YouTube download error:', error);
-                reject(new Error('Failed to download audio from YouTube: ' + error.message));
+                reject(new Error('Download failed: ' + error.message));
             });
             
             writeStream.on('finish', () => {
                 clearTimeout(timeout);
-                console.log('Audio download completed');
                 resolve();
             });
             
             writeStream.on('error', (error) => {
                 clearTimeout(timeout);
-                console.error('File write error:', error);
-                reject(new Error('Failed to save downloaded audio'));
+                reject(new Error('File write failed'));
             });
             
         } catch (error) {
-            reject(new Error('Failed to initialize download: ' + error.message));
+            reject(new Error('Download init failed: ' + error.message));
         }
     });
 }
 
-// Function to process audio with FFmpeg
+// Process audio function
 function processAudioWithFFmpeg(inputPath, outputPath, pitchShift, playbackSpeed) {
     return new Promise((resolve, reject) => {
         try {
@@ -240,18 +296,13 @@ function processAudioWithFFmpeg(inputPath, outputPath, pitchShift, playbackSpeed
                 .audioCodec('mp3')
                 .format('mp3');
             
-            // Build audio filters
             const audioFilters = [];
             
-            // Apply pitch shift if needed
             if (pitchShift !== 0) {
-                // Convert semitones to pitch ratio
                 const pitchRatio = Math.pow(2, pitchShift / 12);
-                // Use rubberband for better quality pitch shifting
                 audioFilters.push(`asetrate=44100*${pitchRatio},aresample=44100`);
             }
             
-            // Apply tempo change if needed (atempo has limits, chain if needed)
             if (playbackSpeed !== 1) {
                 let speed = playbackSpeed;
                 while (speed > 2) {
@@ -267,40 +318,26 @@ function processAudioWithFFmpeg(inputPath, outputPath, pitchShift, playbackSpeed
                 }
             }
             
-            // Apply filters if any exist
             if (audioFilters.length > 0) {
                 command = command.audioFilters(audioFilters);
             }
             
             command
                 .output(outputPath)
-                .on('start', (commandLine) => {
-                    console.log('FFmpeg command:', commandLine);
-                })
-                .on('progress', (progress) => {
-                    if (progress.percent) {
-                        console.log('Processing progress:', Math.round(progress.percent) + '%');
-                    }
-                })
-                .on('end', () => {
-                    console.log('Audio processing completed');
-                    resolve();
-                })
+                .on('end', resolve)
                 .on('error', (error) => {
-                    console.error('FFmpeg error:', error);
-                    reject(new Error('Audio processing failed: ' + error.message));
+                    reject(new Error('Processing failed: ' + error.message));
                 });
                 
-            // Add timeout for FFmpeg processing
             setTimeout(() => {
                 command.kill('SIGKILL');
                 reject(new Error('Processing timeout'));
-            }, 120000); // 2 minute timeout
+            }, 60000);
                 
             command.run();
             
         } catch (error) {
-            reject(new Error('Failed to start audio processing: ' + error.message));
+            reject(new Error('Processing init failed: ' + error.message));
         }
     });
 }
@@ -330,17 +367,6 @@ function formatNumber(num) {
     return n.toString();
 }
 
-// Health check endpoint
-app.get('/api/health', (req, res) => {
-    res.json({ 
-        status: 'OK', 
-        message: 'Pitch Perfect Practice Backend is running',
-        timestamp: new Date().toISOString(),
-        uptime: process.uptime(),
-        memory: process.memoryUsage()
-    });
-});
-
 // Handle 404s
 app.use((req, res) => {
     res.status(404).json({ error: 'Route not found' });
@@ -349,16 +375,15 @@ app.use((req, res) => {
 // Global error handler
 app.use((error, req, res, next) => {
     console.error('Unhandled error:', error);
-    res.status(500).json({ error: 'Internal server error' });
+    if (!res.headersSent) {
+        res.status(500).json({ error: 'Internal server error' });
+    }
 });
 
 // Start server
 const server = app.listen(PORT, '0.0.0.0', () => {
-    console.log(`🚀 Pitch Perfect Practice Backend running on port ${PORT}`);
+    console.log(`🚀 Pitch Perfect Practice running on port ${PORT}`);
     console.log(`📋 Health check: http://localhost:${PORT}/api/health`);
-    console.log(`🎵 Ready to process YouTube audio!`);
-    
-    // Run initial cleanup
     cleanupTempFiles();
 });
 
@@ -369,7 +394,6 @@ const gracefulShutdown = () => {
     server.close(() => {
         console.log('✅ HTTP server closed');
         
-        // Clean up temp directory
         try {
             if (fs.existsSync(tempDir)) {
                 const files = fs.readdirSync(tempDir);
@@ -382,13 +406,10 @@ const gracefulShutdown = () => {
             console.error('❌ Error during cleanup:', error);
         }
         
-        console.log('✅ Graceful shutdown completed');
         process.exit(0);
     });
     
-    // Force shutdown after 10 seconds
     setTimeout(() => {
-        console.log('⚠️  Forcing shutdown');
         process.exit(1);
     }, 10000);
 };
