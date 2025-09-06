@@ -434,4 +434,327 @@
                         <option value="0.25">25% - Very Slow</option>
                         <option value="0.5">50% - Slow Practice</option>
                         <option value="0.75">75% - Learning Pace</option>
-                        <option value="1" selected>100% - Normal Spee
+                        <option value="1" selected>100% - Normal Speed</option>
+                        <option value="1.25">125% - Fast</option>
+                        <option value="1.5">150% - Very Fast</option>
+                        <option value="2">200% - Maximum</option>
+                    </select>
+                </div>
+
+                <div class="status" id="status"></div>
+
+                <div class="buttons">
+                    <button class="btn-primary" id="load-video">🎵 Load Video</button>
+                    <button class="btn-secondary" id="process-audio" disabled>🔄 Process Audio</button>
+                    <button class="btn-secondary" id="download-audio" disabled style="display: none;">💾 Download Audio</button>
+                </div>
+            </div>
+        </div>
+
+        <div class="audio-controls" id="audio-controls">
+            <h3>🎧 Audio Player</h3>
+            <audio controls id="processed-audio" style="width: 100%; margin-bottom: 15px;"></audio>
+            
+            <div class="sync-controls">
+                <button class="btn-secondary" id="sync-video">🔗 Sync with Video</button>
+                <button class="btn-secondary" id="play-both">▶️ Play Both</button>
+                <button class="btn-secondary" id="pause-both">⏸️ Pause Both</button>
+                <button class="btn-secondary" id="reset-both">⏹️ Reset Both</button>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        // Configuration
+        const API_BASE = window.location.origin; // Use same origin for production
+        let currentVideoId = null;
+        let processedAudioBlob = null;
+        let youtubePlayer = null;
+
+        // DOM Elements
+        const elements = {
+            youtubeUrl: document.getElementById('youtube-url'),
+            pitchShift: document.getElementById('pitch-shift'),
+            pitchValue: document.getElementById('pitch-value'),
+            playbackSpeed: document.getElementById('playback-speed'),
+            status: document.getElementById('status'),
+            loadVideoBtn: document.getElementById('load-video'),
+            processAudioBtn: document.getElementById('process-audio'),
+            downloadAudioBtn: document.getElementById('download-audio'),
+            videoPlaceholder: document.getElementById('video-placeholder'),
+            videoContainer: document.getElementById('video-container'),
+            videoInfo: document.getElementById('video-info'),
+            videoTitle: document.getElementById('video-title'),
+            videoDescription: document.getElementById('video-description'),
+            audioControls: document.getElementById('audio-controls'),
+            processedAudio: document.getElementById('processed-audio')
+        };
+
+        // Initialize app
+        document.addEventListener('DOMContentLoaded', function() {
+            initializeEventListeners();
+            updatePitchDisplay();
+        });
+
+        function initializeEventListeners() {
+            elements.youtubeUrl.addEventListener('input', handleUrlInput);
+            elements.pitchShift.addEventListener('input', updatePitchDisplay);
+            elements.loadVideoBtn.addEventListener('click', loadVideo);
+            elements.processAudioBtn.addEventListener('click', processAudio);
+            elements.downloadAudioBtn.addEventListener('click', downloadAudio);
+
+            // Sync controls
+            document.getElementById('sync-video')?.addEventListener('click', syncVideoWithAudio);
+            document.getElementById('play-both')?.addEventListener('click', playBoth);
+            document.getElementById('pause-both')?.addEventListener('click', pauseBoth);
+            document.getElementById('reset-both')?.addEventListener('click', resetBoth);
+        }
+
+        function handleUrlInput() {
+            const url = elements.youtubeUrl.value.trim();
+            if (url && isValidYouTubeUrl(url)) {
+                elements.loadVideoBtn.disabled = false;
+                elements.processAudioBtn.disabled = true;
+                hideAudioControls();
+            } else {
+                elements.loadVideoBtn.disabled = true;
+                elements.processAudioBtn.disabled = true;
+            }
+        }
+
+        function isValidYouTubeUrl(url) {
+            const patterns = [
+                /(?:youtube\.com\/watch\?v=|youtu\.be\/|youtube\.com\/embed\/)([a-zA-Z0-9_-]{11})/,
+                /youtube\.com\/watch\?.*v=([a-zA-Z0-9_-]{11})/
+            ];
+            return patterns.some(pattern => pattern.test(url));
+        }
+
+        function extractVideoId(url) {
+            const patterns = [
+                /(?:youtube\.com\/watch\?v=|youtu\.be\/|youtube\.com\/embed\/)([a-zA-Z0-9_-]{11})/,
+                /youtube\.com\/watch\?.*v=([a-zA-Z0-9_-]{11})/
+            ];
+            
+            for (const pattern of patterns) {
+                const match = url.match(pattern);
+                if (match) return match[1];
+            }
+            return null;
+        }
+
+        function updatePitchDisplay() {
+            const pitch = parseInt(elements.pitchShift.value);
+            const noteNames = ['C', 'C♯', 'D', 'D♯', 'E', 'F', 'F♯', 'G', 'G♯', 'A', 'A♯', 'B'];
+            
+            let displayText = `${pitch > 0 ? '+' : ''}${pitch} semitones`;
+            
+            if (pitch === 0) {
+                displayText += ' (Original Key)';
+            } else {
+                const direction = pitch > 0 ? 'higher' : 'lower';
+                displayText += ` (${Math.abs(pitch)} semitones ${direction})`;
+            }
+            
+            elements.pitchValue.textContent = displayText;
+        }
+
+        async function loadVideo() {
+            const url = elements.youtubeUrl.value.trim();
+            const videoId = extractVideoId(url);
+            
+            if (!videoId) {
+                showStatus('Please enter a valid YouTube URL', 'error');
+                return;
+            }
+
+            showStatus('Loading video...', 'loading');
+            elements.loadVideoBtn.disabled = true;
+
+            try {
+                // Load video info
+                const response = await fetch(`${API_BASE}/api/video-info/${videoId}`);
+                const data = await response.json();
+
+                if (!response.ok) {
+                    throw new Error(data.error || 'Failed to load video information');
+                }
+
+                // Update UI
+                currentVideoId = videoId;
+                displayVideo(videoId);
+                displayVideoInfo(data);
+                
+                elements.processAudioBtn.disabled = false;
+                showStatus('Video loaded successfully! You can now process the audio.', 'success');
+                
+            } catch (error) {
+                console.error('Error loading video:', error);
+                showStatus(`Error: ${error.message}`, 'error');
+                elements.loadVideoBtn.disabled = false;
+            }
+        }
+
+        function displayVideo(videoId) {
+            elements.videoPlaceholder.style.display = 'none';
+            elements.videoContainer.style.display = 'block';
+            elements.videoInfo.style.display = 'block';
+            
+            elements.videoContainer.innerHTML = `
+                <iframe 
+                    src="https://www.youtube.com/embed/${videoId}?enablejsapi=1" 
+                    frameborder="0" 
+                    allowfullscreen>
+                </iframe>
+            `;
+        }
+
+        function displayVideoInfo(info) {
+            elements.videoTitle.textContent = info.title;
+            elements.videoDescription.textContent = `Duration: ${info.duration} | Views: ${info.view_count} | By: ${info.author}`;
+        }
+
+        async function processAudio() {
+            if (!currentVideoId) {
+                showStatus('Please load a video first', 'error');
+                return;
+            }
+
+            const pitchShift = parseInt(elements.pitchShift.value);
+            const playbackSpeed = parseFloat(elements.playbackSpeed.value);
+
+            showStatus('Processing audio... This may take a few moments.', 'loading');
+            elements.processAudioBtn.disabled = true;
+            elements.processAudioBtn.innerHTML = '<span class="loading-spinner"></span>Processing...';
+
+            try {
+                const response = await fetch(`${API_BASE}/api/process-audio`, {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                    },
+                    body: JSON.stringify({
+                        videoId: currentVideoId,
+                        pitchShift: pitchShift,
+                        playbackSpeed: playbackSpeed
+                    })
+                });
+
+                if (!response.ok) {
+                    const errorData = await response.json();
+                    throw new Error(errorData.error || 'Failed to process audio');
+                }
+
+                // Get the audio blob
+                processedAudioBlob = await response.blob();
+                
+                // Create URL for audio element
+                const audioUrl = URL.createObjectURL(processedAudioBlob);
+                elements.processedAudio.src = audioUrl;
+                
+                // Show audio controls
+                showAudioControls();
+                elements.downloadAudioBtn.style.display = 'inline-block';
+                elements.downloadAudioBtn.disabled = false;
+                
+                showStatus('Audio processed successfully! You can now play the processed audio.', 'success');
+                
+            } catch (error) {
+                console.error('Error processing audio:', error);
+                showStatus(`Error: ${error.message}`, 'error');
+            } finally {
+                elements.processAudioBtn.disabled = false;
+                elements.processAudioBtn.innerHTML = '🔄 Process Audio';
+            }
+        }
+
+        function downloadAudio() {
+            if (!processedAudioBlob) {
+                showStatus('No processed audio available for download', 'error');
+                return;
+            }
+
+            const url = URL.createObjectURL(processedAudioBlob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = `processed_audio_${currentVideoId}.mp3`;
+            document.body.appendChild(a);
+            a.click();
+            document.body.removeChild(a);
+            URL.revokeObjectURL(url);
+            
+            showStatus('Audio downloaded successfully!', 'success');
+        }
+
+        function showAudioControls() {
+            elements.audioControls.style.display = 'block';
+        }
+
+        function hideAudioControls() {
+            elements.audioControls.style.display = 'none';
+            elements.downloadAudioBtn.style.display = 'none';
+        }
+
+        function showStatus(message, type) {
+            elements.status.textContent = message;
+            elements.status.className = `status ${type}`;
+            elements.status.style.display = 'block';
+            
+            if (type === 'success') {
+                setTimeout(() => {
+                    elements.status.style.display = 'none';
+                }, 5000);
+            }
+        }
+
+        // Sync controls functions
+        function syncVideoWithAudio() {
+            const iframe = elements.videoContainer.querySelector('iframe');
+            const audio = elements.processedAudio;
+            
+            if (iframe && audio) {
+                // This is a simplified sync - in a real implementation,
+                // you'd need to use the YouTube API for better control
+                audio.currentTime = 0;
+                showStatus('Video and audio synced to start', 'success');
+            }
+        }
+
+        function playBoth() {
+            const audio = elements.processedAudio;
+            if (audio) {
+                audio.play();
+                showStatus('Playing processed audio', 'success');
+            }
+        }
+
+        function pauseBoth() {
+            const audio = elements.processedAudio;
+            if (audio) {
+                audio.pause();
+                showStatus('Audio paused', 'success');
+            }
+        }
+
+        function resetBoth() {
+            const audio = elements.processedAudio;
+            if (audio) {
+                audio.currentTime = 0;
+                audio.pause();
+                showStatus('Audio reset to beginning', 'success');
+            }
+        }
+
+        // Handle page visibility for cleanup
+        document.addEventListener('visibilitychange', function() {
+            if (document.hidden && processedAudioBlob) {
+                // Cleanup when page becomes hidden
+                const audio = elements.processedAudio;
+                if (audio.src) {
+                    URL.revokeObjectURL(audio.src);
+                }
+            }
+        });
+    </script>
+</body>
+</html>
